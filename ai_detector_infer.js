@@ -156,210 +156,225 @@ class SimpleTokenizer {
 // 3. MODEL ARCHITECTURE (Forward Pass)
 // ══════════════════════════════════════════════════════════════════════════════
 
-function model_forward(token_ids, weights, cfg) {
-    const T = cfg.max_seq_len;
-    const D = cfg.embed_dim;
-    const T_dim = cfg.traj_dim;
-
-    // ── 3.1 Embedding ──
-    let emb = new Float32Array(T * D);
-    let embed_w = weights["embed.weight"].data;
-    for (let i = 0; i < T; i++) {
-        let id = token_ids[i];
-        for (let d = 0; d < D; d++) emb[i * D + d] = embed_w[id * D + d];
+class AIDetector {
+    constructor() {
+        this.weights = null;
+        this.tokenizer = null;
+        this.cfg = null;
+        this.threshold = 0.5;
     }
 
-    // ── 3.2 Trajectory Extractor ──
-    const T_eff = T - 1;
-    let traj_cat = new Float32Array(T_eff * (D + 1));
-    for (let i = 0; i < T_eff; i++) {
-        let distSq = 0;
-        for (let d = 0; d < D; d++) {
-            let delta = emb[(i + 1) * D + d] - emb[i * D + d];
-            traj_cat[i * (D + 1) + d] = delta;
-            distSq += delta * delta;
+    /**
+     * Loads the model weights and configuration from a JSON file.
+     */
+    loadModel(filePath) {
+        console.log(`Loading model from ${filePath}…`);
+        const payload = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+
+        this.cfg = payload.config;
+        this.tokenizer = new SimpleTokenizer(payload.tokenizer);
+        this.weights = payload.weights;
+
+        // Convert weight arrays to Float32Array for performance
+        for (let key in this.weights) {
+            this.weights[key].data = new Float32Array(this.weights[key].data);
         }
-        traj_cat[i * (D + 1) + D] = Math.sqrt(distSq);
+
+        // Determine decision threshold
+        if (payload.metrics && payload.metrics.calibrated_threshold !== undefined) {
+            this.threshold = payload.metrics.calibrated_threshold;
+        } else if (this.cfg.decision_threshold !== undefined) {
+            this.threshold = this.cfg.decision_threshold;
+        }
+
+        const balancedAcc = payload.metrics && payload.metrics.final_balanced_accuracy !== undefined 
+                            ? payload.metrics.final_balanced_accuracy.toFixed(6) 
+                            : 'undefined';
+        console.log(`Model loaded | balanced_acc=${balancedAcc} | decision threshold=${this.threshold.toFixed(2)}`);
     }
 
-    let proj1 = linear(traj_cat, weights["traj_extractor.proj.0.weight"].data, weights["traj_extractor.proj.0.bias"].data, T_eff, D + 1, T_dim * 2);
-    let proj1_act = gelu_arr(proj1);
-    let proj2 = linear(proj1_act, weights["traj_extractor.proj.2.weight"].data, weights["traj_extractor.proj.2.bias"].data, T_eff, T_dim * 2, T_dim);
-    let traj = layer_norm(proj2, weights["traj_extractor.norm.weight"].data, weights["traj_extractor.norm.bias"].data, T_eff, T_dim);
+    /**
+     * Internal forward pass logic.
+     */
+    forward(token_ids) {
+        const T = this.cfg.max_seq_len;
+        const D = this.cfg.embed_dim;
+        const T_dim = this.cfg.traj_dim;
+        const weights = this.weights;
 
-    // ── 3.3 Pattern Codebook ──
-    const n_codes = cfg.pattern_codes;
-    const top_k = cfg.pattern_top_k;
-    let cb_w = weights["codebook.codebook"].data;
-    let cb_norm = normalize_rows(cb_w, n_codes, T_dim);
-    let traj_norm = normalize_rows(traj, T_eff, T_dim);
+        // ── 3.1 Embedding ──
+        let emb = new Float32Array(T * D);
+        let embed_w = weights["embed.weight"].data;
+        for (let i = 0; i < T; i++) {
+            let id = token_ids[i];
+            for (let d = 0; d < D; d++) emb[i * D + d] = embed_w[id * D + d];
+        }
 
-    let assigned = new Float32Array(T_eff * T_dim);
-    for (let i = 0; i < T_eff; i++) {
-        let row_sims = new Float32Array(n_codes);
-        for (let j = 0; j < n_codes; j++) {
-            let dot = 0;
-            for (let d = 0; d < T_dim; d++) {
-                dot += traj_norm[i * T_dim + d] * cb_norm[j * T_dim + d];
+        // ── 3.2 Trajectory Extractor ──
+        const T_eff = T - 1;
+        let traj_cat = new Float32Array(T_eff * (D + 1));
+        for (let i = 0; i < T_eff; i++) {
+            let distSq = 0;
+            for (let d = 0; d < D; d++) {
+                let delta = emb[(i + 1) * D + d] - emb[i * D + d];
+                traj_cat[i * (D + 1) + d] = delta;
+                distSq += delta * delta;
             }
-            row_sims[j] = dot;
+            traj_cat[i * (D + 1) + D] = Math.sqrt(distSq);
         }
 
-        let indexed = Array.from(row_sims).map((val, idx) => ({ val, idx }));
-        indexed.sort((a, b) => b.val - a.val);
-        let topk = indexed.slice(0, top_k);
-        let softmax_w = softmax_arr(topk.map(x => x.val));
+        let proj1 = linear(traj_cat, weights["traj_extractor.proj.0.weight"].data, weights["traj_extractor.proj.0.bias"].data, T_eff, D + 1, T_dim * 2);
+        let proj1_act = gelu_arr(proj1);
+        let proj2 = linear(proj1_act, weights["traj_extractor.proj.2.weight"].data, weights["traj_extractor.proj.2.bias"].data, T_eff, T_dim * 2, T_dim);
+        let traj = layer_norm(proj2, weights["traj_extractor.norm.weight"].data, weights["traj_extractor.norm.bias"].data, T_eff, T_dim);
 
-        for (let k = 0; k < top_k; k++) {
-            let w = softmax_w[k];
-            let code_idx = topk[k].idx;
-            for (let d = 0; d < T_dim; d++) {
-                assigned[i * T_dim + d] += w * cb_w[code_idx * T_dim + d];
-            }
-        }
-    }
+        // ── 3.3 Pattern Codebook ──
+        const n_codes = this.cfg.pattern_codes;
+        const top_k = this.cfg.pattern_top_k;
+        let cb_w = weights["codebook.codebook"].data;
+        let cb_norm = normalize_rows(cb_w, n_codes, T_dim);
+        let traj_norm = normalize_rows(traj, T_eff, T_dim);
 
-    // ── 3.4 Pre-Transformer Addition & Positional Embeddings ──
-    let x = new Float32Array(T_eff * T_dim);
-    let pos_w = weights["pos_embed.weight"].data;
-    for (let i = 0; i < T_eff; i++) {
-        for (let d = 0; d < T_dim; d++) {
-            x[i * T_dim + d] = traj[i * T_dim + d] + assigned[i * T_dim + d] + pos_w[i * T_dim + d];
-        }
-    }
-
-    let pad_mask = new Uint8Array(T_eff);
-    for (let i = 0; i < T_eff; i++) {
-        pad_mask[i] = token_ids[i] === 0 ? 1 : 0;
-    }
-
-    // ── 3.5 Transformer Encoder Blocks ──
-    for (let l = 0; l < cfg.n_layers; l++) {
-        let in_proj_w = weights[`encoder.${l}.attn.in_proj_weight`].data;
-        let in_proj_b = weights[`encoder.${l}.attn.in_proj_bias`].data;
-        let out_proj_w = weights[`encoder.${l}.attn.out_proj.weight`].data;
-        let out_proj_b = weights[`encoder.${l}.attn.out_proj.bias`].data;
-
-        // Multihead Attention
-        let QKV = linear(x, in_proj_w, in_proj_b, T_eff, T_dim, 3 * T_dim);
-        let mha_inter = new Float32Array(T_eff * T_dim);
-        const H = cfg.n_heads;
-        const d_k = T_dim / H;
-
-        for (let h = 0; h < H; h++) {
-            for (let i = 0; i < T_eff; i++) {
-                let scores = new Float32Array(T_eff);
-                for (let j = 0; j < T_eff; j++) {
-                    let dot = 0;
-                    for (let d = 0; d < d_k; d++) {
-                        let q = QKV[i * (3 * T_dim) + 0 * T_dim + h * d_k + d];
-                        let k_val = QKV[j * (3 * T_dim) + 1 * T_dim + h * d_k + d];
-                        dot += q * k_val;
-                    }
-                    scores[j] = pad_mask[j] ? -Infinity : dot / Math.sqrt(d_k);
+        let assigned = new Float32Array(T_eff * T_dim);
+        for (let i = 0; i < T_eff; i++) {
+            let row_sims = new Float32Array(n_codes);
+            for (let j = 0; j < n_codes; j++) {
+                let dot = 0;
+                for (let d = 0; d < T_dim; d++) {
+                    dot += traj_norm[i * T_dim + d] * cb_norm[j * T_dim + d];
                 }
+                row_sims[j] = dot;
+            }
 
-                let attn_w = softmax_arr(scores);
+            let indexed = Array.from(row_sims).map((val, idx) => ({ val, idx }));
+            indexed.sort((a, b) => b.val - a.val);
+            let topk = indexed.slice(0, top_k);
+            let softmax_w = softmax_arr(topk.map(x => x.val));
 
-                for (let d = 0; d < d_k; d++) {
-                    let v_sum = 0;
+            for (let k = 0; k < top_k; k++) {
+                let w = softmax_w[k];
+                let code_idx = topk[k].idx;
+                for (let d = 0; d < T_dim; d++) {
+                    assigned[i * T_dim + d] += w * cb_w[code_idx * T_dim + d];
+                }
+            }
+        }
+
+        // ── 3.4 Pre-Transformer Addition & Positional Embeddings ──
+        let x = new Float32Array(T_eff * T_dim);
+        let pos_w = weights["pos_embed.weight"].data;
+        for (let i = 0; i < T_eff; i++) {
+            for (let d = 0; d < T_dim; d++) {
+                x[i * T_dim + d] = traj[i * T_dim + d] + assigned[i * T_dim + d] + pos_w[i * T_dim + d];
+            }
+        }
+
+        let pad_mask = new Uint8Array(T_eff);
+        for (let i = 0; i < T_eff; i++) {
+            pad_mask[i] = token_ids[i] === 0 ? 1 : 0;
+        }
+
+        // ── 3.5 Transformer Encoder Blocks ──
+        for (let l = 0; l < this.cfg.n_layers; l++) {
+            let in_proj_w = weights[`encoder.${l}.attn.in_proj_weight`].data;
+            let in_proj_b = weights[`encoder.${l}.attn.in_proj_bias`].data;
+            let out_proj_w = weights[`encoder.${l}.attn.out_proj.weight`].data;
+            let out_proj_b = weights[`encoder.${l}.attn.out_proj.bias`].data;
+
+            // Multihead Attention
+            let QKV = linear(x, in_proj_w, in_proj_b, T_eff, T_dim, 3 * T_dim);
+            let mha_inter = new Float32Array(T_eff * T_dim);
+            const H = this.cfg.n_heads;
+            const d_k = T_dim / H;
+
+            for (let h = 0; h < H; h++) {
+                for (let i = 0; i < T_eff; i++) {
+                    let scores = new Float32Array(T_eff);
                     for (let j = 0; j < T_eff; j++) {
-                        v_sum += attn_w[j] * QKV[j * (3 * T_dim) + 2 * T_dim + h * d_k + d];
+                        let dot = 0;
+                        for (let d = 0; d < d_k; d++) {
+                            let q = QKV[i * (3 * T_dim) + 0 * T_dim + h * d_k + d];
+                            let k_val = QKV[j * (3 * T_dim) + 1 * T_dim + h * d_k + d];
+                            dot += q * k_val;
+                        }
+                        scores[j] = pad_mask[j] ? -Infinity : dot / Math.sqrt(d_k);
                     }
-                    mha_inter[i * T_dim + h * d_k + d] = v_sum;
+
+                    let attn_w = softmax_arr(scores);
+
+                    for (let d = 0; d < d_k; d++) {
+                        let v_sum = 0;
+                        for (let j = 0; j < T_eff; j++) {
+                            v_sum += attn_w[j] * QKV[j * (3 * T_dim) + 2 * T_dim + h * d_k + d];
+                        }
+                        mha_inter[i * T_dim + h * d_k + d] = v_sum;
+                    }
                 }
             }
+
+            let mha_out = linear(mha_inter, out_proj_w, out_proj_b, T_eff, T_dim, T_dim);
+
+            // Add & LayerNorm 1
+            for (let i = 0; i < x.length; i++) x[i] += mha_out[i];
+            x = layer_norm(x, weights[`encoder.${l}.norm1.weight`].data, weights[`encoder.${l}.norm1.bias`].data, T_eff, T_dim);
+
+            // FFN
+            let ff1 = linear(x, weights[`encoder.${l}.ff.0.weight`].data, weights[`encoder.${l}.ff.0.bias`].data, T_eff, T_dim, this.cfg.ff_dim);
+            let ff1_act = gelu_arr(ff1);
+            let ff2 = linear(ff1_act, weights[`encoder.${l}.ff.3.weight`].data, weights[`encoder.${l}.ff.3.bias`].data, T_eff, this.cfg.ff_dim, T_dim);
+
+            // Add & LayerNorm 2
+            for (let i = 0; i < x.length; i++) x[i] += ff2[i];
+            x = layer_norm(x, weights[`encoder.${l}.norm2.weight`].data, weights[`encoder.${l}.norm2.bias`].data, T_eff, T_dim);
         }
 
-        let mha_out = linear(mha_inter, out_proj_w, out_proj_b, T_eff, T_dim, T_dim);
+        // ── 3.6 Output Normalization & Pooling ──
+        x = layer_norm(x, weights["out_norm.weight"].data, weights["out_norm.bias"].data, T_eff, T_dim);
 
-        // Add & LayerNorm 1
-        for (let i = 0; i < x.length; i++) x[i] += mha_out[i];
-        x = layer_norm(x, weights[`encoder.${l}.norm1.weight`].data, weights[`encoder.${l}.norm1.bias`].data, T_eff, T_dim);
-
-        // FFN
-        let ff1 = linear(x, weights[`encoder.${l}.ff.0.weight`].data, weights[`encoder.${l}.ff.0.bias`].data, T_eff, T_dim, cfg.ff_dim);
-        let ff1_act = gelu_arr(ff1);
-        let ff2 = linear(ff1_act, weights[`encoder.${l}.ff.3.weight`].data, weights[`encoder.${l}.ff.3.bias`].data, T_eff, cfg.ff_dim, T_dim);
-
-        // Add & LayerNorm 2
-        for (let i = 0; i < x.length; i++) x[i] += ff2[i];
-        x = layer_norm(x, weights[`encoder.${l}.norm2.weight`].data, weights[`encoder.${l}.norm2.bias`].data, T_eff, T_dim);
-    }
-
-    // ── 3.6 Output Normalization & Pooling ──
-    x = layer_norm(x, weights["out_norm.weight"].data, weights["out_norm.bias"].data, T_eff, T_dim);
-
-    let pooled = new Float32Array(T_dim);
-    let valid_count = 0;
-    for (let i = 0; i < T_eff; i++) {
-        if (!pad_mask[i]) {
-            valid_count++;
-            for (let d = 0; d < T_dim; d++) pooled[d] += x[i * T_dim + d];
+        let pooled = new Float32Array(T_dim);
+        let valid_count = 0;
+        for (let i = 0; i < T_eff; i++) {
+            if (!pad_mask[i]) {
+                valid_count++;
+                for (let d = 0; d < T_dim; d++) pooled[d] += x[i * T_dim + d];
+            }
         }
-    }
-    if (valid_count > 0) {
-        for (let d = 0; d < T_dim; d++) pooled[d] /= valid_count;
+        if (valid_count > 0) {
+            for (let d = 0; d < T_dim; d++) pooled[d] /= valid_count;
+        }
+
+        // ── 3.7 Classifier Head ──
+        let c1 = linear_1d(pooled, weights["classifier.0.weight"].data, weights["classifier.0.bias"].data, T_dim, Math.floor(T_dim / 2));
+        let c1_act = gelu_arr(c1);
+        let logits = linear_1d(c1_act, weights["classifier.3.weight"].data, weights["classifier.3.bias"].data, Math.floor(T_dim / 2), 2);
+
+        return softmax_arr(logits);
     }
 
-    // ── 3.7 Classifier Head ──
-    let c1 = linear_1d(pooled, weights["classifier.0.weight"].data, weights["classifier.0.bias"].data, T_dim, Math.floor(T_dim / 2));
-    let c1_act = gelu_arr(c1);
-    let logits = linear_1d(c1_act, weights["classifier.3.weight"].data, weights["classifier.3.bias"].data, Math.floor(T_dim / 2), 2);
-
-    return softmax_arr(logits);
+    /**
+     * High-level prediction method for a single string of text.
+     */
+    predict(text, customThreshold = null) {
+        const threshold = customThreshold !== null ? customThreshold : this.threshold;
+        const ids = this.tokenizer.encode(text, this.cfg.max_seq_len);
+        const probs = this.forward(ids);
+        const prob_ai = probs[1];
+        const prob_human = probs[0];
+        
+        const pred = prob_ai >= threshold ? 1 : 0;
+        
+        return {
+            prediction: pred === 1 ? "AI" : "Human",
+            confidence: Number(((pred === 1 ? prob_ai : prob_human) * 100).toFixed(2)),
+            prob_human: Number((prob_human * 100).toFixed(2)),
+            prob_ai: Number((prob_ai * 100).toFixed(2)),
+            threshold: threshold
+        };
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 4. PIPELINE / INFERENCE LOGIC
-// ══════════════════════════════════════════════════════════════════════════════
-
-function loadTrainedModel(filePath) {
-    console.log(`Loading model from ${filePath}…`);
-    const payload = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-
-    const cfg = payload.config;
-    const tokenizer = new SimpleTokenizer(payload.tokenizer);
-    
-    // Convert arrays to Float32Array locally for memory optimization
-    for (let key in payload.weights) {
-        payload.weights[key].data = new Float32Array(payload.weights[key].data);
-    }
-
-    let threshold = 0.5;
-    if (payload.metrics && payload.metrics.calibrated_threshold !== undefined) {
-        threshold = payload.metrics.calibrated_threshold;
-    } else if (cfg.decision_threshold !== undefined) {
-        threshold = cfg.decision_threshold;
-    }
-
-    const balancedAcc = payload.metrics && payload.metrics.final_balanced_accuracy !== undefined 
-                        ? payload.metrics.final_balanced_accuracy.toFixed(6) 
-                        : 'undefined';
-    console.log(`Model loaded | balanced_acc=${balancedAcc} | decision threshold=${threshold.toFixed(2)}`);
-    
-    return { weights: payload.weights, tokenizer, cfg, threshold };
-}
-
-function predict(text, weights, tokenizer, cfg, threshold) {
-    const ids = tokenizer.encode(text, cfg.max_seq_len);
-    const probs = model_forward(ids, weights, cfg);
-    const prob_ai = probs[1];
-    const prob_human = probs[0];
-    
-    const pred = prob_ai >= threshold ? 1 : 0;
-    
-    return {
-        prediction: pred === 1 ? "AI" : "Human",
-        confidence: Number(((pred === 1 ? prob_ai : prob_human) * 100).toFixed(2)),
-        prob_human: Number((prob_human * 100).toFixed(2)),
-        prob_ai: Number((prob_ai * 100).toFixed(2)),
-        threshold: threshold
-    };
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// 5. CLI HANDLER
+// 4. CLI HANDLER
 // ══════════════════════════════════════════════════════════════════════════════
 
 function getSentences(text) {
@@ -369,73 +384,51 @@ function getSentences(text) {
 async function main() {
     let textInput = "";
     let fileInput = "";
-    
-    // Hardcode the default exactly to what the Python file expects
     let modelPath = "trained_model (13).json"; 
     let customThreshold = null;
 
     const args = process.argv.slice(2);
     for (let i = 0; i < args.length; i++) {
-        if (args[i] === "--file" || args[i] === "-f") {
-            fileInput = args[++i];
-        } else if (args[i] === "--model" || args[i] === "-m") {
-            modelPath = args[++i];
-        } else if (args[i] === "--threshold" || args[i] === "-t") {
-            customThreshold = parseFloat(args[++i]);
-        } else if (args[i] === "--") {
-            continue; 
-        } else if (!args[i].startsWith("-")) {
-            textInput = args[i];
-        }
+        if (args[i] === "--file" || args[i] === "-f") fileInput = args[++i];
+        else if (args[i] === "--model" || args[i] === "-m") modelPath = args[++i];
+        else if (args[i] === "--threshold" || args[i] === "-t") customThreshold = parseFloat(args[++i]);
+        else if (!args[i].startsWith("-")) textInput = args[i];
     }
 
-    // Smart-check: If the user typed a filename as text, auto-correct it.
     if (textInput && !fileInput && textInput.endsWith('.txt') && fs.existsSync(textInput)) {
         fileInput = textInput;
         textInput = "";
     }
 
-    // STRICT FILE CHECK: No more silent fallbacks!
     if (!fs.existsSync(modelPath)) {
-        console.error(`\n❌ ERROR: Could not find the model file: "${modelPath}"`);
-        console.error(`Make sure the file is in the same folder, or specify it manually with:`);
-        console.error(`node ai_detector_infer.js --model "your_model_name.json" --file text.txt\n`);
+        console.error(`\n❌ ERROR: Could not find model file: "${modelPath}"`);
         process.exit(1);
     }
 
-    const { weights, tokenizer, cfg, threshold: calThreshold } = loadTrainedModel(modelPath);
-    const threshold = customThreshold !== null ? customThreshold : calThreshold;
+    const detector = new AIDetector();
+    detector.loadModel(modelPath);
 
-    let textsToProcess = [];
-
-    if (fileInput) {
-        const fileContent = fs.readFileSync(fileInput, 'utf-8');
-        textsToProcess = getSentences(fileContent);
-    } else if (textInput) {
-        textsToProcess = getSentences(textInput);
-    }
+    let textsToProcess = fileInput ? getSentences(fs.readFileSync(fileInput, 'utf-8')) 
+                                   : (textInput ? getSentences(textInput) : []);
 
     const processTexts = (texts) => {
-        console.log(`\n${'='.repeat(60)}  (threshold=${threshold.toFixed(2)})`);
+        const thresholdUsed = customThreshold !== null ? customThreshold : detector.threshold;
+        console.log(`\n${'='.repeat(60)}  (threshold=${thresholdUsed.toFixed(2)})`);
         let all_ai_probs = [];
 
         for (let text of texts) {
-            const result = predict(text, weights, tokenizer, cfg, threshold);
+            const result = detector.predict(text, customThreshold);
             all_ai_probs.push(result.prob_ai);
-            
-            const truncText = text.length > 80 ? text.substring(0, 80) + '…' : text;
-            console.log(`\nText    : ${truncText}`);
+            console.log(`\nText    : ${text.length > 80 ? text.substring(0, 80) + '…' : text}`);
             console.log(`Result  : ${result.prediction}  (${result.confidence}% confident)`);
             console.log(`Probs   : Human=${result.prob_human}%  AI=${result.prob_ai}%`);
         }
 
         if (all_ai_probs.length > 0) {
             const avg_ai = all_ai_probs.reduce((a, b) => a + b, 0) / all_ai_probs.length;
-            const overall_pred = (avg_ai / 100.0) >= threshold ? "AI" : "Human";
-            console.log(`\n${'-'.repeat(60)}`);
-            console.log(`OVERALL ANALYSIS (${all_ai_probs.length} sentences)`);
-            console.log(`Average AI Probability: ${avg_ai.toFixed(2)}%`);
-            console.log(`Final Conclusion: ${overall_pred}`);
+            const overall_pred = (avg_ai / 100.0) >= thresholdUsed ? "AI" : "Human";
+            console.log(`\n${'-'.repeat(60)}\nOVERALL ANALYSIS (${all_ai_probs.length} sentences)`);
+            console.log(`Average AI Probability: ${avg_ai.toFixed(2)}%\nFinal Conclusion: ${overall_pred}`);
         }
         console.log("=".repeat(60));
     };
@@ -443,20 +436,12 @@ async function main() {
     if (textsToProcess.length > 0) {
         processTexts(textsToProcess);
     } else {
-        const rl = readline.createInterface({
-            input: process.stdin,
-            output: process.stdout
-        });
-        
+        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
         console.log("\nEnter text to classify (empty line to quit):");
-        
         const promptUser = () => {
             rl.question("> ", (line) => {
                 line = line.trim();
-                if (!line) {
-                    rl.close();
-                    return;
-                }
+                if (!line) { rl.close(); return; }
                 processTexts(getSentences(line));
                 promptUser();
             });

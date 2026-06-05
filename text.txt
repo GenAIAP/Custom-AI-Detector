@@ -1,0 +1,7 @@
+Cellular respiration is basically how our cells get energy from food, and that's huge 'cause we need energy to live, move, grow, and fix ourselves when damaged. Think of mitochondria as the tiny power plants inside cells.
+
+The process starts with glucose from the food we eat. In the cell's cytoplasm, glucose gets chopped up during glycolysis. This phase cranks out initial bits of energy and a bunch of other stuff.
+
+Next, the action shifts to the mitochondria with the Krebs cycle. It pumps out more energy and even lets off CO2. Right after, the electron transport chain joins the party. Oxygen floats around taking electrons and hooking up with hydrogen ions to make water. Throughout, a load of energy builds up and ultimately turns into ATP - the currency cells use for energy.
+
+Bottom line: glucose meets oxygen, and they turn into CO2, H2O, and ATP. Sorta like reverse photosynthesis, it's essential for keeping cells alive. Without it, cells would run dry and just stop working, like a vehicle without gas!

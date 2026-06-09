@@ -1,0 +1,43 @@
+This is just for planning. I need an AI pattern algorithm that works with a lot of AI things because I noticed everything in AI eventually comes down to pattern recognition.
+
+Okay, so a pattern is anything that repeats.
+I need a pattern algorithm that can recognize patterns and relationships between different things. Like smell or taste will link to a food you remembered. I guess it involves pattern and memory. How can humans group these senses into one thing like unsupervised learning?
+
+Neurons that fire together wire together.
+
+Prefix Span algorithm uses 1D array. I need a pattern algorithm that works with 2D arrays since you can feel multiple senses at the same time.
+
+[
+    {
+        smell: [content]
+        taste: [content]
+        touch: [content]
+        sight: [content]
+        hear: [content]
+    },
+    {
+        smell: [content]
+        taste: [content]
+        touch: [content]
+        sight: [content]
+        hear: [content]
+    },
+    {
+        smell: [content]
+        taste: [content]
+        touch: [content]
+        sight: [content]
+        hear: [content]
+    }
+]
+How do you find patterns in here? What if something only happens when two things from different senses happen at the same time?
+Maybe find a similarity between the contents of the cause?
+A cause is a sliced part of the array that is recorded before the effect happened. An effect is like pain or something odd/different.
+
+Prefix Span, or anything basically, to find the effects which is any individual thing that repeats. Then extract the events that happened before the effect and check if any of the senses from each cause to see if their contents have something similar. If there is something similar and happened at the same time, encode that into a pattern and give it an ID. If another sense also repeat at the exact same place, they will be combined into a pattern.
+
+And as I just found out, throwing a neural network with all the features and tell it to detect AI actually works and it finds patterns by itself. Somehow. This doesn't work if I want AI to understand a the world and understand cause and effect though
+
+Maybe Matrix Multiplication of some sort where the senses are combined into a single embedding?
+
+Maybe the model will always predict what's going to happen next aka predicting the cause and decide the actions based on it.
